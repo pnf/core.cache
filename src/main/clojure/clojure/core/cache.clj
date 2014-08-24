@@ -10,7 +10,7 @@
       :author "Fogus"}
   clojure.core.cache
   (:require clojure.data.priority-map)
-  (:import (java.lang.ref ReferenceQueue SoftReference)
+  (:import (java.lang.ref ReferenceQueue Reference SoftReference WeakReference)
            (java.util.concurrent ConcurrentHashMap)))
 
 (set! *warn-on-reflection* true)
@@ -481,27 +481,32 @@
   (toString [_]
     (str cache \, \space lruS \, \space lruQ \, \space tick \, \space limitS \, \space limitQ)))
 
-(defn clear-soft-cache! [^java.util.Map cache ^java.util.Map rcache ^ReferenceQueue rq]
+(defn clear-non-strong-cache! [^java.util.Map cache ^java.util.Map rcache ^ReferenceQueue rq]
   (loop [r (.poll rq)]
     (when r
       (.remove cache (get rcache r))
       (.remove rcache r)
       (recur (.poll rq)))))
 
-(defn make-reference [v rq]
+(defn make-weak-reference [v rq]
+  (if (nil? v)
+    (WeakReference. ::nil rq)
+    (WeakReference. v rq)))
+
+(defn make-soft-reference [v rq]
   (if (nil? v)
     (SoftReference. ::nil rq)
     (SoftReference. v rq)))
 
-(defcache SoftCache [^java.util.Map cache ^java.util.Map rcache rq]
+(defcache NonStrongCache [^java.util.Map cache ^java.util.Map rcache rq make-reference]
   CacheProtocol
   (lookup [_ item]
-    (when-let [^SoftReference r (get cache (or item ::nil))]
+    (when-let [^Reference r (get cache (or item ::nil))]
       (if (= ::nil (.get r))
         nil
         (.get r))))
   (lookup [_ item not-found]
-    (if-let [^SoftReference r (get cache (or item ::nil))]
+    (if-let [^Reference r (get cache (or item ::nil))]
       (if-let [v (.get r)]
         (if (= ::nil v)
           nil
@@ -510,19 +515,19 @@
       not-found))
   (has? [_ item]
     (let [item (or item ::nil)
-          ^SoftReference cell (get cache item)]
+          ^Reference cell (get cache item)]
       (boolean
         (when cell
           (not (nil? (.get cell)))))))
   (hit [this item]
-    (clear-soft-cache! cache rcache rq)
+    (clear-non-strong-cache! cache rcache rq)
     this)
   (miss [this item result]
     (let [item (or item ::nil)
           r (make-reference result rq)]
       (.put cache item r)
       (.put rcache r item)
-      (clear-soft-cache! cache rcache rq)
+      (clear-non-strong-cache! cache rcache rq)
       this))
   (evict [this key]
     (let [key (or key ::nil)
@@ -530,22 +535,22 @@
       (when r
         (.remove cache key)
         (.remove rcache r))
-      (clear-soft-cache! cache rcache rq)
+      (clear-non-strong-cache! cache rcache rq)
       this))
   (seed [_ base]
-    (let [soft-cache? (instance? SoftCache base)
+    (let [soft-cache? (instance? NonStrongCache base)
           cache (ConcurrentHashMap.)
           rcache (ConcurrentHashMap.)
           rq (ReferenceQueue.)]
       (if (seq base)
-        (doseq [[k ^SoftReference v] base]
+        (doseq [[k ^Reference v] base]
           (let [k (or k ::nil)
                 r (if soft-cache?
                     (make-reference (.get v) rq)
                     (make-reference v rq))]
             (.put cache k r)
             (.put rcache r k))))
-      (SoftCache. cache rcache rq)))
+      (NonStrongCache. cache rcache rq make-reference)))
   Object
   (toString [_] (str cache)))
 
@@ -630,7 +635,19 @@
   ConcurrentHashMap."
   [base]
   {:pre [(map? base)]}
-  (seed (SoftCache. (ConcurrentHashMap.) (ConcurrentHashMap.) (ReferenceQueue.))
+  (seed (NonStrongCache. (ConcurrentHashMap.) (ConcurrentHashMap.) (ReferenceQueue.) make-soft-reference)
+        base))
+
+(defn weak-cache-factory
+  "Returns a WeakReference cache.  Cached values will be referred to with
+  WeakReferences, allowing the values to be garbage collected when there is
+  memory pressure on the JVM.
+
+  WeakCache is a mutable cache, since it is always based on a
+  ConcurrentHashMap."
+  [base]
+  {:pre [(map? base)]}
+  (seed (NonStrongCache. (ConcurrentHashMap.) (ConcurrentHashMap.) (ReferenceQueue.) make-weak-reference)
         base))
 
 (comment
